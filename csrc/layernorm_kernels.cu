@@ -9,6 +9,87 @@
 
 namespace vllm {
 
+// Optimized RMS norm kernel with vectorized normalization
+// Key improvement: Vectorized weight reads and output writes in normalization pass
+// This eliminates redundant scalar memory operations that were memory-bandwidth limited
+template <typename scalar_t>
+__global__ void rms_norm_kernel_optimized(
+    scalar_t* __restrict__ out,          // [..., hidden_size]
+    const scalar_t* __restrict__ input,  // [..., hidden_size]
+    const int64_t input_stride,
+    const scalar_t* __restrict__ weight,  // [hidden_size]
+    const float epsilon, const int num_tokens, const int hidden_size) {
+  __shared__ float s_variance;
+  float variance = 0.0f;
+  const scalar_t* input_row = input + blockIdx.x * input_stride;
+  scalar_t* out_row = out + blockIdx.x * hidden_size;
+
+  constexpr int VEC_SIZE = 8;
+  
+  // First pass: compute variance with vectorized reads
+  auto vec_op = [&variance](const vec_n_t<scalar_t, VEC_SIZE>& vec) {
+#pragma unroll
+    for (int i = 0; i < VEC_SIZE; ++i) {
+      float x = static_cast<float>(vec.val[i]);
+      variance += x * x;
+    }
+  };
+  auto scalar_op = [&variance](const scalar_t& val) {
+    float x = static_cast<float>(val);
+    variance += x * x;
+  };
+  vllm::vectorize_read_with_alignment<VEC_SIZE>(
+      input_row, hidden_size, threadIdx.x, blockDim.x, vec_op, scalar_op);
+
+  // Block-level reduction
+  using BlockReduce = cub::BlockReduce<float, 1024>;
+  __shared__ typename BlockReduce::TempStorage reduceStore;
+  variance = BlockReduce(reduceStore).Reduce(variance, CubAddOp{}, blockDim.x);
+
+  if (threadIdx.x == 0) {
+    s_variance = rsqrtf(variance / hidden_size + epsilon);
+  }
+  __syncthreads();
+
+  // Second pass: apply normalization with vectorized reads/writes
+  const float norm_factor = s_variance;
+  
+  auto vec_norm_op = [&](const vec_n_t<scalar_t, VEC_SIZE>& vec_in, 
+                         const vec_n_t<scalar_t, VEC_SIZE>& vec_weight,
+                         vec_n_t<scalar_t, VEC_SIZE>& vec_out) {
+#pragma unroll
+    for (int i = 0; i < VEC_SIZE; ++i) {
+      float x = static_cast<float>(vec_in.val[i]);
+      float w = static_cast<float>(vec_weight.val[i]);
+      vec_out.val[i] = static_cast<scalar_t>((x * norm_factor) * w);
+    }
+  };
+  
+  auto scalar_norm_op = [&](const scalar_t& val_in, const scalar_t& val_weight,
+                            scalar_t& val_out) {
+    float x = static_cast<float>(val_in);
+    float w = static_cast<float>(val_weight);
+    val_out = static_cast<scalar_t>((x * norm_factor) * w);
+  };
+  
+  // Vectorized normalization pass
+  for (int idx = threadIdx.x * VEC_SIZE; idx < hidden_size; idx += blockDim.x * VEC_SIZE) {
+    if (idx + VEC_SIZE <= hidden_size) {
+      // Vectorized path
+      vec_n_t<scalar_t, VEC_SIZE> vec_in, vec_weight, vec_out;
+      vec_in = *reinterpret_cast<const vec_n_t<scalar_t, VEC_SIZE>*>(&input_row[idx]);
+      vec_weight = *reinterpret_cast<const vec_n_t<scalar_t, VEC_SIZE>*>(&weight[idx]);
+      vec_norm_op(vec_in, vec_weight, vec_out);
+      *reinterpret_cast<vec_n_t<scalar_t, VEC_SIZE>*>(&out_row[idx]) = vec_out;
+    } else {
+      // Scalar path for remainder
+      for (int i = idx; i < hidden_size && i < idx + VEC_SIZE; ++i) {
+        scalar_norm_op(input_row[i], weight[i], out_row[i]);
+      }
+    }
+  }
+}
+
 // TODO(woosuk): Further optimize this kernel.
 template <typename scalar_t>
 __global__ void rms_norm_kernel(
@@ -172,13 +253,27 @@ void rms_norm(torch::Tensor& out,     // [..., hidden_size]
   dim3 block(std::min(hidden_size, 1024));
   const at::cuda::OptionalCUDAGuard device_guard(device_of(input_view));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  VLLM_DISPATCH_FLOATING_TYPES(
-      input_view.scalar_type(), "rms_norm_kernel", [&] {
-        vllm::rms_norm_kernel<scalar_t><<<grid, block, 0, stream>>>(
-            out.data_ptr<scalar_t>(), input_view.data_ptr<scalar_t>(),
-            input_stride, weight.data_ptr<scalar_t>(), epsilon, num_tokens,
-            hidden_size);
-      });
+  
+  // Use optimized kernel by default, can disable via env var for testing
+  static bool use_optimized = (std::getenv("VLLM_USE_ORIGINAL_LAYERNORM") == nullptr);
+  
+  if (use_optimized) {
+    VLLM_DISPATCH_FLOATING_TYPES(
+        input_view.scalar_type(), "rms_norm_kernel_optimized", [&] {
+          vllm::rms_norm_kernel_optimized<scalar_t><<<grid, block, 0, stream>>>(
+              out.data_ptr<scalar_t>(), input_view.data_ptr<scalar_t>(),
+              input_stride, weight.data_ptr<scalar_t>(), epsilon, num_tokens,
+              hidden_size);
+        });
+  } else {
+    VLLM_DISPATCH_FLOATING_TYPES(
+        input_view.scalar_type(), "rms_norm_kernel", [&] {
+          vllm::rms_norm_kernel<scalar_t><<<grid, block, 0, stream>>>(
+              out.data_ptr<scalar_t>(), input_view.data_ptr<scalar_t>(),
+              input_stride, weight.data_ptr<scalar_t>(), epsilon, num_tokens,
+              hidden_size);
+        });
+  }
 }
 
 #define LAUNCH_FUSED_ADD_RMS_NORM(width)                                    \
