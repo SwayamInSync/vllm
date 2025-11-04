@@ -59,7 +59,7 @@ __global__ void rms_norm_static_fp8_quant_kernel(
   float const scale_inv = 1.0f / *scale;
 
   for (int idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
-    float x = (float)input[blockIdx.x * input_stride + idx];
+    float x = (float)input_row[idx];
     float const out_norm = ((scalar_t)(x * s_variance)) * weight[idx];
     out[blockIdx.x * hidden_size + idx] =
         scaled_fp8_conversion<true, fp8_type>(out_norm, scale_inv);

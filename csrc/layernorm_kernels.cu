@@ -52,40 +52,47 @@ __global__ void rms_norm_kernel_optimized(
   __syncthreads();
 
   // Second pass: apply normalization with vectorized reads/writes
-  const float norm_factor = s_variance;
+  // Manual vectorization to read from input and weight, write to output
+  // while maintaining numerical accuracy (cast order matters!)
+  constexpr int NORM_VEC_SIZE = 4; // Use smaller vector for better compatibility
   
-  auto vec_norm_op = [&](const vec_n_t<scalar_t, VEC_SIZE>& vec_in, 
-                         const vec_n_t<scalar_t, VEC_SIZE>& vec_weight,
-                         vec_n_t<scalar_t, VEC_SIZE>& vec_out) {
+  // Check if we can use vectorized path
+  uintptr_t input_addr = reinterpret_cast<uintptr_t>(input_row);
+  uintptr_t weight_addr = reinterpret_cast<uintptr_t>(weight);
+  uintptr_t out_addr = reinterpret_cast<uintptr_t>(out_row);
+  constexpr int ALIGN_BYTES = NORM_VEC_SIZE * sizeof(scalar_t);
+  
+  bool is_aligned = (input_addr % ALIGN_BYTES == 0) && 
+                    (weight_addr % ALIGN_BYTES == 0) &&
+                    (out_addr % ALIGN_BYTES == 0) &&
+                    (hidden_size % NORM_VEC_SIZE == 0);
+  
+  if (is_aligned) {
+    // Vectorized path
+    using vec_t = vec_n_t<scalar_t, NORM_VEC_SIZE>;
+    const vec_t* input_vec = reinterpret_cast<const vec_t*>(input_row);
+    const vec_t* weight_vec = reinterpret_cast<const vec_t*>(weight);
+    vec_t* out_vec = reinterpret_cast<vec_t*>(out_row);
+    
+    int num_vec = hidden_size / NORM_VEC_SIZE;
+    for (int vec_idx = threadIdx.x; vec_idx < num_vec; vec_idx += blockDim.x) {
+      vec_t in_v = input_vec[vec_idx];
+      vec_t w_v = weight_vec[vec_idx];
+      vec_t out_v;
+      
 #pragma unroll
-    for (int i = 0; i < VEC_SIZE; ++i) {
-      float x = static_cast<float>(vec_in.val[i]);
-      float w = static_cast<float>(vec_weight.val[i]);
-      vec_out.val[i] = static_cast<scalar_t>((x * norm_factor) * w);
-    }
-  };
-  
-  auto scalar_norm_op = [&](const scalar_t& val_in, const scalar_t& val_weight,
-                            scalar_t& val_out) {
-    float x = static_cast<float>(val_in);
-    float w = static_cast<float>(val_weight);
-    val_out = static_cast<scalar_t>((x * norm_factor) * w);
-  };
-  
-  // Vectorized normalization pass
-  for (int idx = threadIdx.x * VEC_SIZE; idx < hidden_size; idx += blockDim.x * VEC_SIZE) {
-    if (idx + VEC_SIZE <= hidden_size) {
-      // Vectorized path
-      vec_n_t<scalar_t, VEC_SIZE> vec_in, vec_weight, vec_out;
-      vec_in = *reinterpret_cast<const vec_n_t<scalar_t, VEC_SIZE>*>(&input_row[idx]);
-      vec_weight = *reinterpret_cast<const vec_n_t<scalar_t, VEC_SIZE>*>(&weight[idx]);
-      vec_norm_op(vec_in, vec_weight, vec_out);
-      *reinterpret_cast<vec_n_t<scalar_t, VEC_SIZE>*>(&out_row[idx]) = vec_out;
-    } else {
-      // Scalar path for remainder
-      for (int i = idx; i < hidden_size && i < idx + VEC_SIZE; ++i) {
-        scalar_norm_op(input_row[i], weight[i], out_row[i]);
+      for (int i = 0; i < NORM_VEC_SIZE; ++i) {
+        float x = (float)in_v.val[i];
+        out_v.val[i] = ((scalar_t)(x * s_variance)) * w_v.val[i];
       }
+      
+      out_vec[vec_idx] = out_v;
+    }
+  } else {
+    // Scalar fallback for unaligned or incompatible sizes
+    for (int idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
+      float x = (float)input_row[idx];
+      out_row[idx] = ((scalar_t)(x * s_variance)) * weight[idx];
     }
   }
 }
