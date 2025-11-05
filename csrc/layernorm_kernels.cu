@@ -9,9 +9,9 @@
 
 namespace vllm {
 
-// Optimized RMS norm kernel with vectorized normalization
-// Key improvement: Vectorized weight reads and output writes in normalization pass
-// This eliminates redundant scalar memory operations that were memory-bandwidth limited
+// Optimized RMS norm kernel - uses vectorization in second pass for large hidden sizes
+// The key insight is that the original kernel's scalar second pass is already well-optimized
+// We only add vectorization when hidden_size is large enough to benefit from it
 template <typename scalar_t>
 __global__ void rms_norm_kernel_optimized(
     scalar_t* __restrict__ out,          // [..., hidden_size]
@@ -22,10 +22,8 @@ __global__ void rms_norm_kernel_optimized(
   __shared__ float s_variance;
   float variance = 0.0f;
   const scalar_t* input_row = input + blockIdx.x * input_stride;
-  scalar_t* out_row = out + blockIdx.x * hidden_size;
 
   constexpr int VEC_SIZE = 8;
-  
   // First pass: compute variance with vectorized reads
   auto vec_op = [&variance](const vec_n_t<scalar_t, VEC_SIZE>& vec) {
 #pragma unroll
@@ -41,7 +39,6 @@ __global__ void rms_norm_kernel_optimized(
   vllm::vectorize_read_with_alignment<VEC_SIZE>(
       input_row, hidden_size, threadIdx.x, blockDim.x, vec_op, scalar_op);
 
-  // Block-level reduction
   using BlockReduce = cub::BlockReduce<float, 1024>;
   __shared__ typename BlockReduce::TempStorage reduceStore;
   variance = BlockReduce(reduceStore).Reduce(variance, CubAddOp{}, blockDim.x);
@@ -51,49 +48,52 @@ __global__ void rms_norm_kernel_optimized(
   }
   __syncthreads();
 
-  // Second pass: apply normalization with vectorized reads/writes
-  // Manual vectorization to read from input and weight, write to output
-  // while maintaining numerical accuracy (cast order matters!)
-  constexpr int NORM_VEC_SIZE = 4; // Use smaller vector for better compatibility
+  // Second pass: apply normalization
+  // Use vectorized path for larger hidden sizes where memory bandwidth matters more
+  // Use scalar path for smaller hidden sizes where overhead matters more
+  scalar_t* out_row = out + blockIdx.x * hidden_size;
   
-  // Check if we can use vectorized path
-  uintptr_t input_addr = reinterpret_cast<uintptr_t>(input_row);
-  uintptr_t weight_addr = reinterpret_cast<uintptr_t>(weight);
-  uintptr_t out_addr = reinterpret_cast<uintptr_t>(out_row);
-  constexpr int ALIGN_BYTES = NORM_VEC_SIZE * sizeof(scalar_t);
-  
-  bool is_aligned = (input_addr % ALIGN_BYTES == 0) && 
-                    (weight_addr % ALIGN_BYTES == 0) &&
-                    (out_addr % ALIGN_BYTES == 0) &&
-                    (hidden_size % NORM_VEC_SIZE == 0);
-  
-  if (is_aligned) {
-    // Vectorized path
-    using vec_t = vec_n_t<scalar_t, NORM_VEC_SIZE>;
-    const vec_t* input_vec = reinterpret_cast<const vec_t*>(input_row);
-    const vec_t* weight_vec = reinterpret_cast<const vec_t*>(weight);
-    vec_t* out_vec = reinterpret_cast<vec_t*>(out_row);
+  if (hidden_size >= 2048) {
+    // For large hidden sizes, vectorization provides significant bandwidth improvements
+    using vec_t = vec_n_t<scalar_t, VEC_SIZE>;
     
-    int num_vec = hidden_size / NORM_VEC_SIZE;
-    for (int vec_idx = threadIdx.x; vec_idx < num_vec; vec_idx += blockDim.x) {
-      vec_t in_v = input_vec[vec_idx];
-      vec_t w_v = weight_vec[vec_idx];
-      vec_t out_v;
+    uintptr_t input_addr = reinterpret_cast<uintptr_t>(input_row);
+    uintptr_t weight_addr = reinterpret_cast<uintptr_t>(weight);
+    uintptr_t out_addr = reinterpret_cast<uintptr_t>(out_row);
+    constexpr int ALIGN_BYTES = VEC_SIZE * sizeof(scalar_t);
+    
+    bool is_aligned = (input_addr % ALIGN_BYTES == 0) && 
+                      (weight_addr % ALIGN_BYTES == 0) &&
+                      (out_addr % ALIGN_BYTES == 0) &&
+                      (hidden_size % VEC_SIZE == 0);
+    
+    if (is_aligned) {
+      const vec_t* input_vec = reinterpret_cast<const vec_t*>(input_row);
+      const vec_t* weight_vec = reinterpret_cast<const vec_t*>(weight);
+      vec_t* out_vec = reinterpret_cast<vec_t*>(out_row);
       
+      const int num_vec = hidden_size / VEC_SIZE;
+      for (int vec_idx = threadIdx.x; vec_idx < num_vec; vec_idx += blockDim.x) {
+        vec_t in_v = input_vec[vec_idx];
+        vec_t w_v = weight_vec[vec_idx];
+        vec_t out_v;
+        
 #pragma unroll
-      for (int i = 0; i < NORM_VEC_SIZE; ++i) {
-        float x = (float)in_v.val[i];
-        out_v.val[i] = ((scalar_t)(x * s_variance)) * w_v.val[i];
+        for (int i = 0; i < VEC_SIZE; ++i) {
+          float x = (float)in_v.val[i];
+          out_v.val[i] = ((scalar_t)(x * s_variance)) * w_v.val[i];
+        }
+        
+        out_vec[vec_idx] = out_v;
       }
-      
-      out_vec[vec_idx] = out_v;
+      return;  // Early return for vectorized path
     }
-  } else {
-    // Scalar fallback for unaligned or incompatible sizes
-    for (int idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
-      float x = (float)input_row[idx];
-      out_row[idx] = ((scalar_t)(x * s_variance)) * weight[idx];
-    }
+  }
+  
+  // Scalar path - same as original kernel, well-optimized by compiler
+  for (int idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
+    float x = (float)input_row[idx];
+    out_row[idx] = ((scalar_t)(x * s_variance)) * weight[idx];
   }
 }
 
