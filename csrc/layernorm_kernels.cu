@@ -9,7 +9,16 @@
 
 namespace vllm {
 
-// TODO(woosuk): Further optimize this kernel.
+// Warp-level reduction for better performance on smaller hidden sizes
+__device__ __forceinline__ float warpReduceSum(float val) {
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    val += __shfl_xor_sync(0xffffffff, val, offset);
+  }
+  return val;
+}
+
+// Optimized RMS norm kernel with vectorized normalization pass
 template <typename scalar_t>
 __global__ void rms_norm_kernel(
     scalar_t* __restrict__ out,          // [..., hidden_size]
@@ -18,9 +27,13 @@ __global__ void rms_norm_kernel(
     const scalar_t* __restrict__ weight,  // [hidden_size]
     const float epsilon, const int num_tokens, const int hidden_size) {
   __shared__ float s_variance;
+  __shared__ float warp_variances[32];  // Max 32 warps per block
+
   float variance = 0.0f;
   const scalar_t* input_row = input + blockIdx.x * input_stride;
+  scalar_t* out_row = out + blockIdx.x * hidden_size;
 
+  // First pass: compute variance with vectorized reads
   constexpr int VEC_SIZE = 8;
   auto vec_op = [&variance](const vec_n_t<scalar_t, VEC_SIZE>& vec) {
 #pragma unroll
@@ -36,19 +49,63 @@ __global__ void rms_norm_kernel(
   vllm::vectorize_read_with_alignment<VEC_SIZE>(
       input_row, hidden_size, threadIdx.x, blockDim.x, vec_op, scalar_op);
 
-  using BlockReduce = cub::BlockReduce<float, 1024>;
-  __shared__ typename BlockReduce::TempStorage reduceStore;
-  variance = BlockReduce(reduceStore).Reduce(variance, CubAddOp{}, blockDim.x);
+  // Warp-level reduction followed by block-level reduction
+  const int warp_id = threadIdx.x / 32;
+  const int lane_id = threadIdx.x % 32;
+  variance = warpReduceSum(variance);
+
+  if (lane_id == 0) {
+    warp_variances[warp_id] = variance;
+  }
+  __syncthreads();
+
+  // Final reduction across warps
+  if (threadIdx.x < 32) {
+    variance = (threadIdx.x < (blockDim.x + 31) / 32) ? warp_variances[threadIdx.x] : 0.0f;
+    variance = warpReduceSum(variance);
+  }
 
   if (threadIdx.x == 0) {
     s_variance = rsqrtf(variance / hidden_size + epsilon);
   }
   __syncthreads();
 
-  for (int idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
-    float x = (float)input[blockIdx.x * input_stride + idx];
-    out[blockIdx.x * hidden_size + idx] =
-        ((scalar_t)(x * s_variance)) * weight[idx];
+  // Second pass: apply normalization with vectorized reads/writes
+  const float rms_scale = s_variance;
+
+  // Vectorized normalization for aligned accesses
+  auto norm_vec_op = [&](const vec_n_t<scalar_t, VEC_SIZE>& in_vec,
+                         const vec_n_t<scalar_t, VEC_SIZE>& weight_vec,
+                         int idx) {
+    vec_n_t<scalar_t, VEC_SIZE> out_vec;
+#pragma unroll
+    for (int i = 0; i < VEC_SIZE; ++i) {
+      float x = static_cast<float>(in_vec.val[i]);
+      float w = static_cast<float>(weight_vec.val[i]);
+      out_vec.val[i] = static_cast<scalar_t>((x * rms_scale) * w);
+    }
+    *reinterpret_cast<vec_n_t<scalar_t, VEC_SIZE>*>(&out_row[idx]) = out_vec;
+  };
+
+  auto norm_scalar_op = [&](const scalar_t& in_val, const scalar_t& weight_val, int idx) {
+    float x = static_cast<float>(in_val);
+    float w = static_cast<float>(weight_val);
+    out_row[idx] = static_cast<scalar_t>((x * rms_scale) * w);
+  };
+
+  // Process elements with vectorization where possible
+  const int num_vec_elems = (hidden_size / VEC_SIZE) * VEC_SIZE;
+  for (int idx = threadIdx.x * VEC_SIZE; idx < num_vec_elems; idx += blockDim.x * VEC_SIZE) {
+    vec_n_t<scalar_t, VEC_SIZE> in_vec =
+        *reinterpret_cast<const vec_n_t<scalar_t, VEC_SIZE>*>(&input_row[idx]);
+    vec_n_t<scalar_t, VEC_SIZE> weight_vec =
+        *reinterpret_cast<const vec_n_t<scalar_t, VEC_SIZE>*>(&weight[idx]);
+    norm_vec_op(in_vec, weight_vec, idx);
+  }
+
+  // Handle remaining elements
+  for (int idx = num_vec_elems + threadIdx.x; idx < hidden_size; idx += blockDim.x) {
+    norm_scalar_op(input_row[idx], weight[idx], idx);
   }
 }
 
@@ -71,6 +128,8 @@ fused_add_rms_norm_kernel(
   const int vec_hidden_size = hidden_size / width;
   const int64_t vec_input_stride = input_stride / width;
   __shared__ float s_variance;
+  __shared__ float warp_variances[32];  // Max 32 warps per block
+
   float variance = 0.0f;
   /* These and the argument pointers are all declared `restrict` as they are
      not aliased in practice. Argument pointers should not be dereferenced
@@ -82,6 +141,8 @@ fused_add_rms_norm_kernel(
   auto* __restrict__ weight_v =
       reinterpret_cast<const _f16Vec<scalar_t, width>*>(weight);
 
+  // First pass: add and compute variance with loop unrolling
+  #pragma unroll 4
   for (int idx = threadIdx.x; idx < vec_hidden_size; idx += blockDim.x) {
     int id = blockIdx.x * vec_hidden_size + idx;
     int64_t strided_id = blockIdx.x * vec_input_stride + idx;
@@ -91,20 +152,35 @@ fused_add_rms_norm_kernel(
     residual_v[id] = temp;
   }
 
-  using BlockReduce = cub::BlockReduce<float, 1024>;
-  __shared__ typename BlockReduce::TempStorage reduceStore;
-  variance = BlockReduce(reduceStore).Reduce(variance, CubAddOp{}, blockDim.x);
+  // Warp-level reduction followed by block-level reduction
+  const int warp_id = threadIdx.x / 32;
+  const int lane_id = threadIdx.x % 32;
+  variance = warpReduceSum(variance);
+
+  if (lane_id == 0) {
+    warp_variances[warp_id] = variance;
+  }
+  __syncthreads();
+
+  // Final reduction across warps
+  if (threadIdx.x < 32) {
+    variance = (threadIdx.x < (blockDim.x + 31) / 32) ? warp_variances[threadIdx.x] : 0.0f;
+    variance = warpReduceSum(variance);
+  }
 
   if (threadIdx.x == 0) {
     s_variance = rsqrtf(variance / hidden_size + epsilon);
   }
   __syncthreads();
 
+  // Second pass: apply normalization with loop unrolling
+  const float rms_scale = s_variance;
+  #pragma unroll 4
   for (int idx = threadIdx.x; idx < vec_hidden_size; idx += blockDim.x) {
     int id = blockIdx.x * vec_hidden_size + idx;
     int64_t strided_id = blockIdx.x * vec_input_stride + idx;
     _f16Vec<scalar_t, width> temp = residual_v[id];
-    temp *= s_variance;
+    temp *= rms_scale;
     temp *= weight_v[idx];
     input_v[strided_id] = temp;
   }
@@ -122,8 +198,12 @@ fused_add_rms_norm_kernel(
     const scalar_t* __restrict__ weight,  // [hidden_size]
     const float epsilon, const int num_tokens, const int hidden_size) {
   __shared__ float s_variance;
+  __shared__ float warp_variances[32];  // Max 32 warps per block
+
   float variance = 0.0f;
 
+  // First pass: add and compute variance with loop unrolling
+  #pragma unroll 4
   for (int idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
     scalar_t z = input[blockIdx.x * input_stride + idx];
     z += residual[blockIdx.x * hidden_size + idx];
@@ -132,19 +212,34 @@ fused_add_rms_norm_kernel(
     residual[blockIdx.x * hidden_size + idx] = z;
   }
 
-  using BlockReduce = cub::BlockReduce<float, 1024>;
-  __shared__ typename BlockReduce::TempStorage reduceStore;
-  variance = BlockReduce(reduceStore).Reduce(variance, CubAddOp{}, blockDim.x);
+  // Warp-level reduction followed by block-level reduction
+  const int warp_id = threadIdx.x / 32;
+  const int lane_id = threadIdx.x % 32;
+  variance = warpReduceSum(variance);
+
+  if (lane_id == 0) {
+    warp_variances[warp_id] = variance;
+  }
+  __syncthreads();
+
+  // Final reduction across warps
+  if (threadIdx.x < 32) {
+    variance = (threadIdx.x < (blockDim.x + 31) / 32) ? warp_variances[threadIdx.x] : 0.0f;
+    variance = warpReduceSum(variance);
+  }
 
   if (threadIdx.x == 0) {
     s_variance = rsqrtf(variance / hidden_size + epsilon);
   }
   __syncthreads();
 
+  // Second pass: apply normalization with loop unrolling
+  const float rms_scale = s_variance;
+  #pragma unroll 4
   for (int idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
     float x = (float)residual[blockIdx.x * hidden_size + idx];
-    input[blockIdx.x * input_stride + idx] =
-        ((scalar_t)(x * s_variance)) * weight[idx];
+    float w = (float)weight[idx];
+    input[blockIdx.x * input_stride + idx] = (scalar_t)((x * rms_scale) * w);
   }
 }
 
